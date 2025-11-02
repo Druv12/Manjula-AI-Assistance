@@ -13,7 +13,6 @@ import time
 import openai
 from requests.adapters import HTTPAdapter, Retry
 import json
-import logging
 import hashlib
 import smtplib
 from email.mime.text import MIMEText
@@ -21,6 +20,79 @@ from email.mime.multipart import MIMEMultipart
 import random
 import string
 import socket
+import subprocess
+import sys
+from pathlib import Path
+import tempfile
+import logging
+from PIL import Image, ImageDraw, ImageFont
+from gtts import gTTS
+import argostranslate.package
+import argostranslate.translate
+# Correct import (one line)
+from langdetect import detect, DetectorFactory
+
+# Now you can safely set the seed
+DetectorFactory.seed = 0   # Makes detection consistent across runs
+
+# ✅ ENHANCED LANGUAGE SUPPORT
+SUPPORTED_LANGUAGES = {
+    # Indian Languages (22)
+    "Hindi": "hi",
+    "Bengali": "bn",
+    "Telugu": "te",
+    "Marathi": "mr",
+    "Tamil": "ta",
+    "Gujarati": "gu",
+    "Urdu": "ur",
+    "Kannada": "kn",
+    "Odia": "or",
+    "Malayalam": "ml",
+    "Punjabi": "pa",
+    "Assamese": "as",
+    "Maithili": "mai",
+    "Sanskrit": "sa",
+    "Konkani": "kok",
+    "Nepali": "ne",
+    "Sindhi": "sd",
+    "Dogri": "doi",
+    "Kashmiri": "ks",
+    "Manipuri": "mni",
+    "Bodo": "brx",
+    "Santali": "sat",
+
+    # Foreign Languages (30+)
+    "English": "en",
+    "Spanish": "es",
+    "French": "fr",
+    "German": "de",
+    "Chinese (Simplified)": "zh",
+    "Japanese": "ja",
+    "Korean": "ko",
+    "Russian": "ru",
+    "Arabic": "ar",
+    "Portuguese": "pt",
+    "Italian": "it",
+    "Dutch": "nl",
+    "Turkish": "tr",
+    "Polish": "pl",
+    "Swedish": "sv",
+    "Norwegian": "no",
+    "Danish": "da",
+    "Finnish": "fi",
+    "Greek": "el",
+    "Czech": "cs",
+    "Hungarian": "hu",
+    "Romanian": "ro",
+    "Ukrainian": "uk",
+    "Indonesian": "id",
+    "Malay": "ms",
+    "Thai": "th",
+    "Vietnamese": "vi",
+    "Hebrew": "he",
+    "Persian": "fa",
+    "Swahili": "sw",
+}
 
 # MongoDB imports
 try:
@@ -93,6 +165,28 @@ except ImportError:
     logging.warning("'speech_recognition' library not found. Install with: pip install SpeechRecognition")
     SPEECH_RECOGNITION_AVAILABLE = False
 
+# ============================================================================
+# VIDEO GENERATION SETUP - Add this block here
+# ============================================================================
+# Try to import imageio and numpy (required for local video generation)
+IMAGEIO_AVAILABLE = False
+imageio = None
+np = None
+
+try:
+    import imageio
+    import numpy as np
+    IMAGEIO_AVAILABLE = True
+    logging.info("✅ imageio and numpy available for local video generation")
+except ImportError:
+    logging.warning("⚠️ imageio or numpy not found. Install with: pip install imageio imageio-ffmpeg numpy")
+    IMAGEIO_AVAILABLE = False
+
+# Video generation API keys
+OPENAI_SORA_API_KEY = os.getenv("OPENAI_SORA_API_KEY")
+RUNWAYML_GEN2_API_KEY = os.getenv("RUNWAYML_GEN2_API_KEY")
+# ============================================================================
+
 # Rate limit timers
 api_reset_times = {
     "text_qa": None,
@@ -125,7 +219,233 @@ current_user = {"username": "Guest", "logged_in": False, "is_guest": True}
 guest_chat_count = 0
 GUEST_CHAT_LIMIT = 10
 
+# ================================
+#  LANGUAGE TRANSLATION MODULE
+# ================================
+# --- Cache for installed languages ---
+INSTALLED_LANGS = {}
 
+
+def _ensure_language_pack(source_code: str, target_code: str):
+    """Download language pack if not already installed."""
+    pack_key = f"{source_code}->{target_code}"
+
+    if pack_key in INSTALLED_LANGS:
+        return INSTALLED_LANGS[pack_key]
+
+    # Update package index
+    argostranslate.package.update_package_index()
+    available_packages = argostranslate.package.get_available_packages()
+
+    # Find package: source → target
+    package_to_install = next(
+        (pkg for pkg in available_packages
+         if pkg.from_code == source_code and pkg.to_code == target_code),
+        None
+    )
+
+    if package_to_install is None:
+        # Try to find via English as intermediate
+        logging.warning(f"Direct {source_code}->{target_code} not found. Trying via English...")
+
+        # Install source -> en
+        pkg_to_en = next(
+            (pkg for pkg in available_packages
+             if pkg.from_code == source_code and pkg.to_code == "en"),
+            None
+        )
+
+        # Install en -> target
+        pkg_from_en = next(
+            (pkg for pkg in available_packages
+             if pkg.from_code == "en" and pkg.to_code == target_code),
+            None
+        )
+
+        if pkg_to_en:
+            download_path = pkg_to_en.download()
+            argostranslate.package.install_from_path(download_path)
+            logging.info(f"Installed intermediate pack: {source_code}->en")
+
+        if pkg_from_en:
+            download_path = pkg_from_en.download()
+            argostranslate.package.install_from_path(download_path)
+            logging.info(f"Installed intermediate pack: en->{target_code}")
+
+        INSTALLED_LANGS[pack_key] = True
+        return True
+
+    # Direct package found - install it
+    download_path = package_to_install.download()
+    argostranslate.package.install_from_path(download_path)
+    INSTALLED_LANGS[pack_key] = True
+    logging.info(f"Installed Argos language pack: {source_code}->{target_code}")
+    return True
+
+
+def translate_text(text: str, target_lang: str = "es", source_lang: str = "auto") -> str:
+    """
+    Translate text using:
+    1. LibreTranslate (online, fast)
+    2. ArgosTranslate (offline fallback)
+    """
+    # Detect source language if auto
+    if source_lang == "auto":
+        try:
+            source_lang = detect(text)
+            logging.info(f"Detected source language: {source_lang}")
+        except Exception as e:
+            logging.warning(f"Language detection failed: {e}. Assuming English.")
+            source_lang = "en"
+
+    # Don't translate if source and target are the same
+    if source_lang == target_lang:
+        return text
+
+    # ---- 1. Try LibreTranslate (free, no key) ----
+    try:
+        url = "https://libretranslate.com/translate"
+        payload = {
+            "q": text,
+            "source": source_lang,
+            "target": target_lang,
+            "format": "text"
+        }
+        headers = {"Content-Type": "application/json"}
+        response = requests.post(url, json=payload, headers=headers, timeout=10)
+        if response.status_code == 200:
+            result = response.json()
+            translated = result.get("translatedText", "").strip()
+            if translated:
+                logging.info(f"✅ LibreTranslate success: {source_lang}->{target_lang}")
+                return translated
+    except Exception as e:
+        logging.warning(f"LibreTranslate failed: {e}")
+
+    # ---- 2. Fallback to ArgosTranslate (offline) ----
+    try:
+        # Ensure language pack is installed
+        _ensure_language_pack(source_lang, target_lang)
+
+        # Get installed languages
+        installed_languages = argostranslate.translate.get_installed_languages()
+
+        # Find translation path
+        from_lang = next((lang for lang in installed_languages if lang.code == source_lang), None)
+        to_lang = next((lang for lang in installed_languages if lang.code == target_lang), None)
+
+        if not from_lang:
+            logging.error(f"Source language '{source_lang}' not available in ArgosTranslate")
+            return f"[Translation failed: Source language '{source_lang}' not supported]"
+
+        if not to_lang:
+            logging.error(f"Target language '{target_lang}' not available in ArgosTranslate")
+            return f"[Translation failed: Target language '{target_lang}' not supported]"
+
+        # Get translation
+        translation = from_lang.get_translation(to_lang)
+
+        if not translation:
+            # Try via English as intermediate
+            logging.warning(f"No direct {source_lang}->{target_lang}. Trying via English...")
+
+            en_lang = next((lang for lang in installed_languages if lang.code == "en"), None)
+            if en_lang:
+                # source -> en
+                trans_to_en = from_lang.get_translation(en_lang)
+                if trans_to_en:
+                    intermediate_text = trans_to_en.translate(text)
+
+                    # en -> target
+                    trans_from_en = en_lang.get_translation(to_lang)
+                    if trans_from_en:
+                        translated = trans_from_en.translate(intermediate_text)
+                        logging.info(f"✅ ArgosTranslate via English: {source_lang}->en->{target_lang}")
+                        return translated.strip()
+
+            return f"[Translation failed: No translation path available for {source_lang}->{target_lang}]"
+
+        # Direct translation available
+        translated = translation.translate(text)
+        logging.info(f"✅ ArgosTranslate direct: {source_lang}->{target_lang}")
+        return translated.strip()
+
+    except Exception as e:
+        logging.error(f"ArgosTranslate failed: {e}")
+        return f"[Translation failed: {e}]"
+
+
+def speak_translation(text: str, lang: str):
+    """Generate MP3 audio of the translated text."""
+    try:
+        tts = gTTS(text=text, lang=lang, slow=False)
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
+        tts.save(tmp.name)
+        logging.info(f"✅ Audio generated for language: {lang}")
+        return tmp.name
+    except Exception as e:
+        logging.error(f"TTS failed: {e}")
+        return None
+
+
+# --- Save translation history (only for logged-in users) ---
+def save_translation_history(userid, original, translated, target_lang, src_lang="en"):
+    """Save translation to MongoDB (logged-in users only)."""
+    if not MONGODB_AVAILABLE or not current_user.get("logged_in"):
+        return
+    try:
+        col = db["translation_history"]
+        col.insert_one({
+            "userid": userid,
+            "original": original,
+            "translated": translated,
+            "source_lang": src_lang,
+            "target_lang": target_lang,
+            "timestamp": datetime.now()
+        })
+        logging.info(f"✅ Translation history saved for user: {userid}")
+    except Exception as e:
+        logging.error(f"Failed to save translation history: {e}")
+
+
+def perform_translation(text, target_lang):
+    """Main translation function with auto-detection"""
+    if not text.strip():
+        return "", None, "Please enter text to translate."
+
+    # Auto-detect source language
+    try:
+        source_lang = detect(text)
+        logging.info(f"Detected source language: {source_lang}")
+    except Exception as e:
+        logging.warning(f"Language detection failed: {e}. Assuming English.")
+        source_lang = "en"
+
+    # Check if source and target are the same
+    if source_lang == target_lang:
+        return text, None, f"**Original:** {text}\n\n⚠️ Source and target languages are the same ({source_lang})"
+
+    # Translate
+    translated = translate_text(text, target_lang, source_lang)
+
+    # Generate audio
+    audio_path = speak_translation(translated, target_lang)
+
+    # Save to history (if logged in)
+    if current_user.get("logged_in"):
+        save_translation_history(
+            current_user["username"],
+            text,
+            translated,
+            target_lang,
+            source_lang
+        )
+
+    return (
+        translated,
+        audio_path,
+        f"**Original ({source_lang}):** {text}\n\n**Translated ({target_lang}):** {translated}"
+    )
 # --- User Authentication Functions ---
 def hash_password(password):
     """Hash password using SHA-256"""
@@ -151,41 +471,72 @@ def clear_guest_history():
 def start_as_guest():
     """Start using app as guest with limited features"""
     global guest_chat_count, current_session_id
+
+    # ---- reset guest state -------------------------------------------------
     guest_chat_count = 0
-    current_user["username"] = "Guest"
-    current_user["logged_in"] = False
-    current_user["is_guest"] = True
+    current_user["username"]   = "Guest"
+    current_user["logged_in"]  = False
+    current_user["is_guest"]   = True
 
     current_session_id += 1
     clear_guest_history()
 
+    # ---- 16 return values (order must match demo.load outputs) ------------
     return (
-        "✅ **Welcome, Guest!** You can try the Chat feature with 10 free messages.\n\n"
+        # 1. guest_status (Markdown)
+        "Wellcome, Guest! You can try the Chat feature with 10 free messages.\n\n"
         "**Register to unlock:**\n"
-        "- 📄 File Q&A\n"
-        "- 🎨 Image Generation\n"
-        "- 🎥 Video Generation\n"
-        "- 🖼️ Image Search\n"
-        "- 🔍 Image Q&A\n"
-        "- 📊 Usage Statistics\n"
-        "- ♾️ Unlimited Chat",
+        "- File Q&A\n"
+        "- Image Generation\n"
+        "- Video Generation\n"
+        "- Image Search\n"
+        "- Image Q&A\n"
+        "- Usage Statistics\n"
+        "- Unlimited Chat",
+
+        # 2. auth_section (Group) – hide login/register
         gr.update(visible=False),
+
+        # 3. main_app (Group) – show the main UI
         gr.update(visible=True),
-        f"👤 **Guest Mode** | 💬 {guest_chat_count}/{GUEST_CHAT_LIMIT} chats used",
+
+        # 4. user_info (Markdown)
+        f"Guest Mode | {guest_chat_count}/{GUEST_CHAT_LIMIT} chats used",
+
+        # 5-9. Feature tabs – all hidden for guests
+        gr.update(visible=False),   # file_qa_tab
+        gr.update(visible=False),   # image_gen_tab
+        gr.update(visible=False),   # image_qa_tab
+        gr.update(visible=False),   # image_search_tab
+        gr.update(visible=False),   # video_gen_tab
+
+        # 10. translation_tab – **must be here**
         gr.update(visible=False),
+
+        # 11. stats_btn (Button) – hidden for guests
         gr.update(visible=False),
-        gr.update(visible=False),
-        gr.update(visible=False),
-        gr.update(visible=False),
-        gr.update(visible=False),
+
+        # 12. history_chatbot (Chatbot) – empty
         [],
-        gr.update(visible=True,
-                  value=f"⚠️ **Guest Mode:** You have {GUEST_CHAT_LIMIT}/{GUEST_CHAT_LIMIT} free chats remaining. Register to get unlimited access!"),
+
+        # 13. guest_chat_warning (Markdown)
+        gr.update(
+            visible=True,
+            value=(
+                f"Guest Mode: You have {GUEST_CHAT_LIMIT}/{GUEST_CHAT_LIMIT} "
+                "free chats remaining. Register to get unlimited access!"
+            )
+        ),
+
+        # 14. chatbot (Chatbot) – empty conversation
         [],
+
+        # 15. session_id (State)
         current_session_id,
+
+        # 16. mic_chat (Audio) – no file yet
         None
     )
-
 
 def generate_otp(length=6):
     """Generate a random 6-digit OTP"""
@@ -438,9 +789,10 @@ def verify_otp_and_register(email, otp_input):
 
 
 def login_user(username, password):
-    """Login user - FIXED with complete session isolation"""
+    """Login user - FIXED with complete session isolation & 16 outputs"""
     global current_session_id, guest_chat_count
 
+    # === 1. MONGODB NOT AVAILABLE (Fallback) ===
     if not MONGODB_AVAILABLE:
         current_session_id += 1
         clear_guest_history()
@@ -451,42 +803,46 @@ def login_user(username, password):
         current_user["is_guest"] = False
 
         return (
-            f"✅ **Welcome back, {username}!**\n\n🎉 You have full access to all features!",
-            gr.update(visible=False),
-            gr.update(visible=True),
-            f"👤 **Logged in as:** {username}",
-            gr.update(visible=True),
-            gr.update(visible=True),
-            gr.update(visible=True),
-            gr.update(visible=True),
-            gr.update(visible=True),
-            gr.update(visible=True),
-            [],
-            gr.update(visible=False),
-            [],
-            current_session_id,
-            None
+            f"**Welcome back, {username}!**\n\nYou have full access to all features!",
+            gr.update(visible=False),  # auth_section
+            gr.update(visible=True),   # main_app
+            f"**Logged in as:** {username}",
+            gr.update(visible=True),   # file_qa_tab
+            gr.update(visible=True),   # image_gen_tab
+            gr.update(visible=True),   # image_qa_tab
+            gr.update(visible=True),   # image_search_tab
+            gr.update(visible=True),   # video_gen_tab
+            gr.update(visible=True),   # translation_tab ← ADDED
+            gr.update(visible=True),   # stats_btn
+            [],                        # history_chatbot
+            gr.update(visible=False),  # guest_chat_warning
+            [],                        # chatbot
+            current_session_id,        # session_id
+            None                       # mic_chat
         )
 
+    # === 2. EMPTY CREDENTIALS ===
     if not username or not password:
         return (
-            "❌ Username and password are required!",
-            gr.update(visible=True),
-            gr.update(visible=False),
-            "👤 **Not logged in**",
-            gr.update(visible=False),
-            gr.update(visible=False),
-            gr.update(visible=False),
-            gr.update(visible=False),
-            gr.update(visible=False),
-            gr.update(visible=False),
-            [],
-            gr.update(visible=False),
-            [],
-            current_session_id,
-            None
+            "**Username and password are required!**",
+            gr.update(visible=True),   # auth_section
+            gr.update(visible=False),  # main_app
+            "**Not logged in**",
+            gr.update(visible=False),  # file_qa_tab
+            gr.update(visible=False),  # image_gen_tab
+            gr.update(visible=False),  # image_qa_tab
+            gr.update(visible=False),  # image_search_tab
+            gr.update(visible=False),  # video_gen_tab
+            gr.update(visible=False),  # translation_tab ← ADDED
+            gr.update(visible=False),  # stats_btn
+            [],                        # history_chatbot
+            gr.update(visible=False),  # guest_chat_warning
+            [],                        # chatbot
+            current_session_id,        # session_id
+            None                       # mic_chat
         )
 
+    # === 3. VALID LOGIN ===
     try:
         user = users_collection.find_one({"username": username.lower().strip()})
 
@@ -513,62 +869,67 @@ def login_user(username, password):
             )
             current_user["last_ip"] = client_ip
 
-            logging.info(f"✅ User logged in: {username} | Session ID: {current_session_id} | Guest data WIPED")
+            logging.info(f"User logged in: {username} | Session ID: {current_session_id} | Guest data WIPED")
 
             return (
-                f"✅ **Welcome back, {username}!**\n\n🎉 You have full access to all features!",
-                gr.update(visible=False),
-                gr.update(visible=True),
-                f"👤 **Logged in as:** {username}",
-                gr.update(visible=True),
-                gr.update(visible=True),
-                gr.update(visible=True),
-                gr.update(visible=True),
-                gr.update(visible=True),
-                gr.update(visible=True),
-                [],
-                gr.update(visible=False),
-                [],
-                current_session_id,
-                None
+                f"**Welcome back, {username}!**\n\nYou have full access to all features!",
+                gr.update(visible=False),  # auth_section
+                gr.update(visible=True),   # main_app
+                f"**Logged in as:** {username}",
+                gr.update(visible=True),   # file_qa_tab
+                gr.update(visible=True),   # image_gen_tab
+                gr.update(visible=True),   # image_qa_tab
+                gr.update(visible=True),   # image_search_tab
+                gr.update(visible=True),   # video_gen_tab
+                gr.update(visible=True),   # translation_tab ← ADDED
+                gr.update(visible=True),   # stats_btn
+                [],                        # history_chatbot
+                gr.update(visible=False),  # guest_chat_warning
+                [],                        # chatbot
+                current_session_id,        # session_id
+                None                       # mic_chat
             )
         else:
+            # === 4. INVALID CREDENTIALS ===
             return (
-                "❌ Invalid username or password!",
-                gr.update(visible=True),
-                gr.update(visible=False),
-                "👤 **Not logged in**",
-                gr.update(visible=False),
-                gr.update(visible=False),
-                gr.update(visible=False),
-                gr.update(visible=False),
-                gr.update(visible=False),
-                gr.update(visible=False),
-                [],
-                gr.update(visible=True),
-                [],
-                current_session_id,
-                None
+                "**Invalid username or password!**",
+                gr.update(visible=True),   # auth_section
+                gr.update(visible=False),  # main_app
+                "**Not logged in**",
+                gr.update(visible=False),  # file_qa_tab
+                gr.update(visible=False),  # image_gen_tab
+                gr.update(visible=False),  # image_qa_tab
+                gr.update(visible=False),  # image_search_tab
+                gr.update(visible=False),  # video_gen_tab
+                gr.update(visible=False),  # translation_tab ← ADDED
+                gr.update(visible=False),  # stats_btn
+                [],                        # history_chatbot
+                gr.update(visible=True),   # guest_chat_warning
+                [],                        # chatbot
+                current_session_id,        # session_id
+                None                       # mic_chat
             )
 
+    # === 5. EXCEPTION ===
     except Exception as e:
         logging.error(f"Login error: {e}")
         return (
-            f"❌ Login failed: {str(e)}",
-            gr.update(visible=True),
-            gr.update(visible=False),
-            "👤 **Not logged in**",
-            gr.update(visible=False),
-            gr.update(visible=False),
-            gr.update(visible=False),
-            gr.update(visible=False),
-            gr.update(visible=False),
-            gr.update(visible=False),
-            [],
-            gr.update(visible=True),
-            [],
-            current_session_id,
-            None
+            f"**Login failed:** {str(e)}",
+            gr.update(visible=True),   # auth_section
+            gr.update(visible=False),  # main_app
+            "**Not logged in**",
+            gr.update(visible=False),  # file_qa_tab
+            gr.update(visible=False),  # image_gen_tab
+            gr.update(visible=False),  # image_qa_tab
+            gr.update(visible=False),  # image_search_tab
+            gr.update(visible=False),  # video_gen_tab
+            gr.update(visible=False),  # translation_tab ← ADDED
+            gr.update(visible=False),  # stats_btn
+            [],                        # history_chatbot
+            gr.update(visible=True),   # guest_chat_warning
+            [],                        # chatbot
+            current_session_id,        # session_id
+            None                       # mic_chat
         )
 
 
@@ -590,22 +951,22 @@ def logout_user():
 
     return (
         "✅ Logged out successfully! Please login or register to continue.",
-        gr.update(visible=True),
-        gr.update(visible=False),
-        "👤 **Not logged in**",
-        gr.update(visible=False),
-        gr.update(visible=False),
-        gr.update(visible=False),
-        gr.update(visible=False),
-        gr.update(visible=False),
-        gr.update(visible=False),
-        [],
-        gr.update(visible=False),
-        [],
-        current_session_id,
-        None
+        gr.update(visible=True),  # auth_section
+        gr.update(visible=False),  # main_app
+        "👤 **Not logged in**",  # user_info
+        gr.update(visible=False),  # file_qa_tab
+        gr.update(visible=False),  # image_gen_tab
+        gr.update(visible=False),  # image_qa_tab
+        gr.update(visible=False),  # image_search_tab
+        gr.update(visible=False),  # video_gen_tab
+        gr.update(visible=False),  # translation_tab
+        gr.update(visible=False),  # stats_btn
+        [],  # history_chatbot
+        gr.update(visible=False),  # guest_chat_warning
+        [],  # chatbot
+        current_session_id,  # session_id
+        None  # ✅ mic_chat - THIS WAS MISSING!
     )
-
 
 def format_history_for_chatbot():
     """Fetch ONLY current user's history - COMPLETELY ISOLATED"""
@@ -958,6 +1319,56 @@ def transcribe_audio(audio_filepath):
     except Exception as e:
         return f"❌ Error processing audio: {e}"
 
+# ================================
+#  ANY-TO-ANY TRANSLATION FUNCTIONS
+# ================================
+
+def _detect_language(text: str) -> str:
+    """Auto-detect source language (fallback = en)"""
+    try:
+        return detect(text)
+    except Exception:
+        return "en"
+
+
+def translate_any_to_any(text: str, target_lang: str):
+    """Detect source → translate → speak → return markdown + audio path"""
+    if current_user["is_guest"]:
+        return ("**Register** to use translation.", None)
+
+    if not text.strip():
+        return ("Please enter text to translate.", None)
+
+    src_lang = _detect_language(text)
+    logging.info(f"Detected source: {src_lang} → target: {target_lang}")
+
+    translated, audio_path, full_msg = perform_translation(text, target_lang)
+
+    if current_user.get("logged_in"):
+        save_translation_history(
+            current_user["username"],
+            text,
+            translated,
+            target_lang,
+            src_lang
+        )
+
+    return full_msg, audio_path
+
+
+def transcribe_and_translate_any(audio_filepath, target_lang):
+    """Voice → transcribe → detect → translate → speak"""
+    if current_user["is_guest"]:
+        return ("**Register** to use voice translation.", None)
+
+    if not audio_filepath:
+        return ("No audio recorded.", None)
+
+    text = transcribe_audio(audio_filepath)
+    if text.startswith("Could not") or text.startswith("SpeechRecognition"):
+        return (text, None)
+
+    return translate_any_to_any(text, target_lang)
 
 def check_guest_feature_access(feature_name):
     """Check if guest user can access a specific feature"""
@@ -1165,6 +1576,12 @@ def query_and_update_warning(prompt, history, session_id_state):
     result_history, result_input, result_session = query_model(prompt, history, session_id_state)
     warning = update_guest_warning()
     return result_history, result_input, warning, result_session
+
+def on_user_input_detect_translation(user_input, user_is_registered):
+    if user_is_registered and user_input.lower().startswith("translate"):
+        return gr.update(visible=True), gr.update(value="")
+    else:
+        return gr.update(visible=False), user_input
 
 
 def get_public_ip():
@@ -1671,13 +2088,366 @@ def process_audio_for_image_qa(audio_filepath, image):
 
 
 # --- Video Generation ---
-def generate_video(prompt):
-    """Generate video - returns file paths properly"""
-    guest_check = check_guest_feature_access("Video Generation")
-    if guest_check:
-        yield guest_check, None
-        return
+def install_package(package):
+    """Install a package if not already installed"""
+    try:
+        __import__(package)
+        return True
+    except ImportError:
+        try:
+            subprocess.check_call([sys.executable, "-m", "pip", "install", package])
+            return True
+        except Exception as e:
+            logging.error(f"Failed to install {package}: {e}")
+            return False
 
+
+def generate_video_huggingface_svd_fixed(prompt: str):
+    """
+    FIXED: Generate actual video using Hugging Face
+    Uses the correct working model endpoint
+    """
+    if not HF_API_KEY:
+        return None, "Hugging Face API key not configured."
+
+    try:
+        logging.info("🎬 Generating real video with Hugging Face (FREE)...")
+        headers = {"Authorization": f"Bearer {HF_API_KEY}"}
+
+        # Step 1: Generate initial frame
+        logging.info("🎨 Step 1/2: Generating initial frame...")
+        img_url = "https://api-inference.huggingface.co/models/black-forest-labs/FLUX.1-schnell"
+        img_response = requests.post(
+            img_url,
+            headers=headers,
+            json={"inputs": prompt},
+            timeout=120
+        )
+
+        if img_response.status_code != 200:
+            logging.warning(f"Initial image generation failed: {img_response.status_code}")
+            return None, f"Failed to generate starting frame: {img_response.status_code}"
+
+        initial_image = Image.open(io.BytesIO(img_response.content))
+        initial_image = initial_image.resize((1024, 576), Resampling.LANCZOS)
+
+        # Save as bytes for video generation
+        img_bytes = io.BytesIO()
+        initial_image.save(img_bytes, format='PNG')
+        img_bytes.seek(0)
+
+        logging.info("✅ Initial frame generated. Now creating video with motion...")
+
+        # Step 2: Try multiple working video generation models
+        video_models = [
+            "stabilityai/stable-video-diffusion-img2vid-xt",
+            "ali-vilab/i2vgen-xl",
+            "damo-vilab/text-to-video-ms-1.7b"
+        ]
+
+        for model in video_models:
+            try:
+                logging.info(f"🎞️ Trying {model}...")
+                video_url = f"https://api-inference.huggingface.co/models/{model}"
+
+                video_response = requests.post(
+                    video_url,
+                    headers=headers,
+                    data=img_bytes.getvalue(),
+                    timeout=180
+                )
+
+                if video_response.status_code == 200:
+                    with tempfile.NamedTemporaryFile(delete=False, suffix='.mp4') as tmp:
+                        tmp.write(video_response.content)
+                        video_path = tmp.name
+
+                    file_size = Path(video_path).stat().st_size / 1024
+                    logging.info(f"✅ Real video generated with {model}! Size: {file_size:.1f} KB")
+                    return video_path, f"✅ Real video with motion generated! (Size: {file_size:.1f} KB)"
+
+                elif video_response.status_code == 503:
+                    logging.warning(f"{model} is loading (503)...")
+                    continue
+                else:
+                    logging.warning(f"{model} failed: {video_response.status_code}")
+                    continue
+
+            except Exception as e:
+                logging.warning(f"{model} error: {e}")
+                continue
+
+        # All HF models failed
+        return None, "⏳ Hugging Face video models are loading. Try again in 20-30 seconds."
+
+    except Exception as e:
+        logging.error(f"Hugging Face video generation failed: {e}")
+        return None, f"❌ Video generation failed: {str(e)}"
+
+
+def generate_video_animatediff_hf(prompt: str):
+    """
+    Alternative: Generate video using AnimateDiff on Hugging Face (FREE)
+    This is a direct text-to-video model
+    """
+    if not HF_API_KEY:
+        return None, "Hugging Face API key not configured."
+
+    try:
+        logging.info("🎬 Generating video with AnimateDiff (Hugging Face)...")
+        headers = {"Authorization": f"Bearer {HF_API_KEY}"}
+
+        # Direct text-to-video generation
+        video_url = "https://api-inference.huggingface.co/models/guoyww/animatediff-motion-adapter-v1-5-2"
+
+        response = requests.post(
+            video_url,
+            headers=headers,
+            json={
+                "inputs": prompt,
+                "parameters": {
+                    "num_frames": 16,
+                    "num_inference_steps": 25
+                }
+            },
+            timeout=180
+        )
+
+        if response.status_code == 200:
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.mp4') as tmp:
+                tmp.write(response.content)
+                video_path = tmp.name
+
+            file_size = Path(video_path).stat().st_size / 1024
+            return video_path, f"✅ Video generated with AnimateDiff! (Size: {file_size:.1f} KB)"
+
+        elif response.status_code == 503:
+            return None, "⏳ AnimateDiff model is loading (20-30s). Please try again."
+        else:
+            logging.error(f"AnimateDiff failed: {response.status_code}")
+            return None, f"AnimateDiff failed: {response.status_code}"
+
+    except Exception as e:
+        logging.error(f"AnimateDiff HF failed: {e}")
+        return None, f"❌ AnimateDiff failed: {str(e)}"
+
+
+def generate_video_text2video_zero(prompt: str):
+    """
+    Generate video using Text2Video-Zero (100% FREE, works well)
+    """
+    if not HF_API_KEY:
+        return None, "Hugging Face API key not configured."
+
+    try:
+        logging.info("🎬 Generating video with Text2Video-Zero...")
+        headers = {"Authorization": f"Bearer {HF_API_KEY}"}
+
+        video_url = "https://api-inference.huggingface.co/models/damo-vilab/text-to-video-ms-1.7b"
+
+        response = requests.post(
+            video_url,
+            headers=headers,
+            json={
+                "inputs": prompt,
+                "parameters": {
+                    "num_frames": 16
+                }
+            },
+            timeout=180
+        )
+
+        if response.status_code == 200:
+            # Response might be a video file or JSON with URL
+            content_type = response.headers.get('content-type', '')
+
+            if 'video' in content_type or len(response.content) > 100000:
+                with tempfile.NamedTemporaryFile(delete=False, suffix='.mp4') as tmp:
+                    tmp.write(response.content)
+                    video_path = tmp.name
+
+                file_size = Path(video_path).stat().st_size / 1024
+                return video_path, f"✅ Video generated with Text2Video! (Size: {file_size:.1f} KB)"
+            else:
+                # Try to parse JSON response
+                try:
+                    result = response.json()
+                    video_url = result.get('video_url') or result.get('url')
+                    if video_url:
+                        vid_response = requests.get(video_url, timeout=60)
+                        with tempfile.NamedTemporaryFile(delete=False, suffix='.mp4') as tmp:
+                            tmp.write(vid_response.content)
+                            video_path = tmp.name
+                        return video_path, "✅ Video generated with Text2Video!"
+                except:
+                    pass
+
+                return None, "Unexpected response format from Text2Video"
+
+        elif response.status_code == 503:
+            return None, "⏳ Text2Video model is loading. Try again in 20-30s."
+        else:
+            return None, f"Text2Video failed: {response.status_code}"
+
+    except Exception as e:
+        logging.error(f"Text2Video failed: {e}")
+        return None, f"❌ Text2Video failed: {str(e)}"
+
+
+def generate_video_replicate_zeroscope(prompt: str):
+    """
+    Generate video using Replicate's Zeroscope model
+    Requires REPLICATE_API_TOKEN and billing credits
+    """
+    if not REPLICATE_AVAILABLE or not replicate:
+        return None, "Replicate not configured or library not installed."
+
+    try:
+        logging.info("🎬 Generating video with Replicate Zeroscope...")
+
+        output = replicate.run(
+            "anotherjesse/zeroscope-v2-xl:9f747673945c62801b13b84701c783929c0ee784e4748ec062204894dda1a351",
+            input={
+                "prompt": prompt,
+                "num_frames": 24,
+                "num_inference_steps": 50,
+            }
+        )
+
+        # Download the video
+        if output:
+            video_url = output if isinstance(output, str) else output[0]
+            response = requests.get(video_url, timeout=60)
+
+            if response.status_code == 200:
+                with tempfile.NamedTemporaryFile(delete=False, suffix='.mp4') as tmp:
+                    tmp.write(response.content)
+                    video_path = tmp.name
+
+                file_size = Path(video_path).stat().st_size / 1024
+                return video_path, f"✅ Video generated with Zeroscope! (Size: {file_size:.1f} KB)"
+
+        return None, "Failed to retrieve video from Replicate"
+
+    except Exception as e:
+        logging.error(f"Replicate Zeroscope failed: {e}")
+        return None, f"❌ Replicate failed: {str(e)}"
+
+
+def generate_simple_video_locally_enhanced(prompt: str, duration=3, fps=10):
+    """
+    LOCAL FALLBACK: Generate a simple animated video using images
+    This creates a zoom/pan effect on a generated or placeholder image
+    """
+    if not IMAGEIO_AVAILABLE:
+        return None, (
+            "❌ Local video generation unavailable.\n\n"
+            "**Install required packages:**\n"
+            "```bash\n"
+            "pip install imageio imageio-ffmpeg numpy\n"
+            "```"
+        )
+
+    try:
+        logging.info("🎨 Creating local animated video...")
+
+        # Try to generate an image first
+        base_image = None
+
+        # Method 1: Try Pollinations
+        try:
+            encoded_prompt = quote(prompt)
+            url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=1024&height=576&nologo=true"
+            response = requests.get(url, timeout=30)
+            if response.status_code == 200 and len(response.content) > 5000:
+                base_image = Image.open(io.BytesIO(response.content))
+                logging.info("✅ Got base image from Pollinations")
+        except Exception as e:
+            logging.warning(f"Pollinations failed for video base: {e}")
+
+        # Method 2: Create a placeholder if image generation fails
+        if base_image is None:
+            logging.info("Creating placeholder image for animation...")
+            base_image = Image.new('RGB', (1024, 576), color=(30, 30, 50))
+            draw = ImageDraw.Draw(base_image)
+
+            # Try to use a nice font, fallback to default
+            try:
+                font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 40)
+            except:
+                font = ImageFont.load_default()
+
+            # Wrap text
+            words = prompt.split()
+            lines = []
+            current_line = []
+            for word in words:
+                current_line.append(word)
+                if len(' '.join(current_line)) > 40:
+                    lines.append(' '.join(current_line[:-1]))
+                    current_line = [word]
+            if current_line:
+                lines.append(' '.join(current_line))
+
+            # Draw text centered
+            y_offset = 200
+            for line in lines[:4]:  # Max 4 lines
+                bbox = draw.textbbox((0, 0), line, font=font)
+                text_width = bbox[2] - bbox[0]
+                x = (1024 - text_width) // 2
+                draw.text((x, y_offset), line, fill=(255, 255, 255), font=font)
+                y_offset += 60
+
+        # Create animation frames with zoom effect
+        frames = []
+        total_frames = duration * fps
+
+        for i in range(total_frames):
+            # Calculate zoom factor (1.0 to 1.3)
+            zoom = 1.0 + (i / total_frames) * 0.3
+
+            # Calculate new size
+            new_width = int(1024 * zoom)
+            new_height = int(576 * zoom)
+
+            # Resize image
+            zoomed = base_image.resize((new_width, new_height), Resampling.LANCZOS)
+
+            # Crop to original size (centered)
+            left = (new_width - 1024) // 2
+            top = (new_height - 576) // 2
+            cropped = zoomed.crop((left, top, left + 1024, top + 576))
+
+            # Convert to numpy array
+            frames.append(np.array(cropped))
+
+        # Save as video
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.mp4') as tmp:
+            video_path = tmp.name
+
+        imageio.mimsave(video_path, frames, fps=fps, codec='libx264', quality=8)
+
+        file_size = Path(video_path).stat().st_size / 1024
+
+        return video_path, (
+            f"✅ Local animated video created! (Size: {file_size:.1f} KB)\n\n"
+            f"⚠️ This is a fallback animation since cloud services are unavailable.\n\n"
+            f"**For better results, try:**\n"
+            f"- Waiting 20-30 seconds (HF models need warm-up)\n"
+            f"- Using external services: Pika Labs, RunwayML Gen-2"
+        )
+
+    except Exception as e:
+        logging.error(f"Local video generation failed: {e}")
+        return None, f"❌ Local video generation failed: {str(e)}"
+
+# ============================================================================
+# UPDATED generate_video() - Replace your current one with this
+# ============================================================================
+def generate_video(prompt: str):
+    """
+    MAIN VIDEO GENERATION with working FREE services
+    """
     access_check = check_feature_access("video_gen")
     if access_check:
         yield access_check, None
@@ -1688,206 +2458,136 @@ def generate_video(prompt):
         yield limit_msg, None
         return
 
-    if not prompt:
-        yield "Please enter a prompt.", None
+    if not prompt or not prompt.strip():
+        yield "❌ Please enter a video prompt.", None
         return
 
     increment_usage("video_gen")
 
-    if len(prompt) > 100:
-        yield f"⚠️ **Long prompt detected!** ({len(prompt)} characters)\n\nFree services work better with shorter prompts (under 50 characters).\n\nExample: Instead of your current prompt, try:\n*\"massive shark attacks sailor boat in storm\"*\n\nContinuing with your prompt...", None
-        time.sleep(2)
-
-    if REPLICATE_AVAILABLE and REPLICATE_API_TOKEN:
-        yield f"⏳ Trying **Replicate** (Premium Quality)...\n\nPrompt: *{prompt}*\n\nThis may take 1-2 minutes...", None
-
-        try:
-            output = replicate.run(
-                "deforum/deforum_stable_diffusion",
-                input={
-                    "prompt": prompt,
-                    "max_frames": 50,
-                }
-            )
-
-            video_url = None
-            if isinstance(output, str):
-                video_url = output
-            elif isinstance(output, list) and len(output) > 0:
-                video_url = output[0] if isinstance(output[0], str) else None
-            elif hasattr(output, 'url'):
-                video_url = output.url
-
-            if video_url and isinstance(video_url, str) and video_url.startswith('http'):
-                try:
-                    import tempfile
-                    video_response = requests.get(video_url, timeout=60)
-                    if video_response.status_code == 200:
-                        with tempfile.NamedTemporaryFile(delete=False, suffix='.mp4') as tmp:
-                            tmp.write(video_response.content)
-                            video_path = tmp.name
-
-                        success_msg = f"✅ **Video generated with Replicate (Premium)!**\n\n**Prompt:** *{prompt}*"
-                        logging.info(f"✅ Replicate success: {video_url}")
-
-                        if current_user["is_guest"]:
-                            add_to_guest_history("video_gen", prompt, success_msg,
-                                                 {"model": "Replicate", "url": video_url})
-                        else:
-                            save_interaction_to_db("video_gen", prompt, success_msg,
-                                                   {"model": "Replicate", "url": video_url})
-
-                        yield success_msg, video_path
-                        return
-                except Exception as download_error:
-                    logging.error(f"Failed to download Replicate video: {download_error}")
-
-        except Exception as e:
-            error_msg = str(e).lower()
-            if any(x in error_msg for x in ["billing", "payment", "throttled", "rate limit", "429"]):
-                logging.warning(f"⚠️ Replicate billing/rate limit issue: {e}")
-                yield f"⚠️ Replicate requires billing setup or hit rate limit.\n\n**Switching to FREE services...**", None
-                time.sleep(1)
+    # Method 1: Text2Video-Zero (Hugging Face - FREE & Works!)
+    if HF_API_KEY:
+        yield "⏳ Generating real video with Text2Video-Zero (FREE)...", None
+        video_path, status = generate_video_text2video_zero(prompt)
+        if video_path:
+            if current_user["is_guest"]:
+                add_to_guest_history("video_gen", prompt, status, {"service": "Text2Video-Zero"})
             else:
-                logging.warning(f"⚠️ Replicate failed: {e}")
-                yield f"⚠️ Replicate unavailable.\n\n**Switching to FREE services...**", None
-                time.sleep(1)
+                save_interaction_to_db("video_gen", prompt, status, {"service": "Text2Video-Zero"})
+            yield status, video_path
+            return
+        else:
+            yield f"⚠️ Text2Video: {status}. Trying AnimateDiff...", None
 
-    hf_models = [
-        {"name": "AnimateDiff", "api_url": "https://api-inference.huggingface.co/models/guoyww/animatediff"},
-        {"name": "Text2Video-Zero", "api_url": "https://api-inference.huggingface.co/models/PAIR/text2video-zero"},
-        {"name": "ModelScope Text-to-Video",
-         "api_url": "https://api-inference.huggingface.co/models/damo-vilab/text-to-video-ms-1.7b"},
-    ]
+        # Method 2: AnimateDiff (Hugging Face - FREE)
+        yield "⏳ Trying AnimateDiff (FREE)...", None
+        video_path, status = generate_video_animatediff_hf(prompt)
+        if video_path:
+            if current_user["is_guest"]:
+                add_to_guest_history("video_gen", prompt, status, {"service": "AnimateDiff HF"})
+            else:
+                save_interaction_to_db("video_gen", prompt, status, {"service": "AnimateDiff HF"})
+            yield status, video_path
+            return
+        else:
+            yield f"⚠️ AnimateDiff: {status}. Trying Stable Video Diffusion...", None
 
-    for model_info in hf_models:
-        model_name = model_info["name"]
-        api_url = model_info["api_url"]
+        # Method 3: Stable Video Diffusion (Hugging Face - FREE)
+        yield "⏳ Trying Stable Video Diffusion (FREE)...", None
+        video_path, status = generate_video_huggingface_svd_fixed(prompt)
+        if video_path:
+            if current_user["is_guest"]:
+                add_to_guest_history("video_gen", prompt, status, {"service": "Stable Video Diffusion"})
+            else:
+                save_interaction_to_db("video_gen", prompt, status, {"service": "Stable Video Diffusion"})
+            yield status, video_path
+            return
+        else:
+            yield f"⚠️ SVD: {status}. Falling back to local animation...", None
 
-        yield f"⏳ Generating video with **{model_name}** (FREE)...\n\nPrompt: *{prompt}*\n\nThis may take 1-3 minutes. Please wait...", None
+    # Method 4: Replicate (if configured with credits)
+    if REPLICATE_AVAILABLE:
+        yield "⏳ Trying Replicate services...", None
+        video_path, status = generate_video_replicate_zeroscope(prompt)
+        if video_path:
+            if current_user["is_guest"]:
+                add_to_guest_history("video_gen", prompt, status, {"service": "Zeroscope"})
+            else:
+                save_interaction_to_db("video_gen", prompt, status, {"service": "Zeroscope"})
+            yield status, video_path
+            return
 
-        try:
-            headers = {}
-            if HF_API_KEY:
-                headers["Authorization"] = f"Bearer {HF_API_KEY}"
+    # Method 5: Local fallback (animated image)
+    yield "⏳ Creating animated video (local fallback)...", None
+    video_path, status = generate_simple_video_locally_enhanced(prompt, duration=3, fps=10)
 
-            payload = {"inputs": prompt}
-            logging.info(f"Attempting FREE model: {model_name}")
+    if video_path:
+        if current_user["is_guest"]:
+            add_to_guest_history("video_gen", prompt, status, {"service": "Local Animation"})
+        else:
+            save_interaction_to_db("video_gen", prompt, status, {"service": "Local Animation"})
+        yield status, video_path
+        return
 
-            response = requests.post(api_url, headers=headers, json=payload, timeout=180)
-
-            if response.status_code == 200 and len(response.content) > 1000:
-                import tempfile
-                with tempfile.NamedTemporaryFile(delete=False, suffix='.mp4') as tmp:
-                    tmp.write(response.content)
-                    video_path = tmp.name
-
-                file_size = os.path.getsize(video_path)
-                if file_size > 1000:
-                    success_msg = f"✅ **Video generated successfully (FREE)!**\n\n**Model:** {model_name}\n**Prompt:** *{prompt[:100]}{'...' if len(prompt) > 100 else ''}*\n**Size:** {file_size / 1024:.1f} KB"
-                    logging.info(f"✅ {model_name} success - {file_size} bytes")
-
-                    if current_user["is_guest"]:
-                        add_to_guest_history("video_gen", prompt, success_msg,
-                                             {"model": model_name, "service": "Hugging Face (FREE)",
-                                              "size": f"{file_size / 1024:.1f} KB"})
-                    else:
-                        save_interaction_to_db("video_gen", prompt, success_msg,
-                                               {"model": model_name, "service": "Hugging Face (FREE)",
-                                                "size": f"{file_size / 1024:.1f} KB"})
-
-                    yield success_msg, video_path
-                    return
-
-            elif response.status_code == 503:
-                yield f"⏳ {model_name} is loading... Waiting 20 seconds and retrying...", None
-                time.sleep(20)
-                response = requests.post(api_url, headers=headers, json=payload, timeout=180)
-                if response.status_code == 200 and len(response.content) > 1000:
-                    import tempfile
-                    with tempfile.NamedTemporaryFile(delete=False, suffix='.mp4') as tmp:
-                        tmp.write(response.content)
-                        video_path = tmp.name
-                    file_size = os.path.getsize(video_path)
-                    if file_size > 1000:
-                        success_msg = f"✅ **Video generated successfully (FREE)!**\n\n**Model:** {model_name}\n**Prompt:** *{prompt[:100]}{'...' if len(prompt) > 100 else ''}*\n**Size:** {file_size / 1024:.1f} KB"
-
-                        if current_user["is_guest"]:
-                            add_to_guest_history("video_gen", prompt, success_msg,
-                                                 {"model": model_name, "size": f"{file_size / 1024:.1f} KB"})
-                        else:
-                            save_interaction_to_db("video_gen", prompt, success_msg,
-                                                   {"model": model_name, "size": f"{file_size / 1024:.1f} KB"})
-
-                        yield success_msg, video_path
-                        return
-
-        except requests.exceptions.Timeout:
-            logging.error(f"{model_name} timed out")
-            continue
-        except Exception as e:
-            logging.error(f"Error with {model_name}: {e}")
-            continue
-
-    final_error = (
-        f"❌ **All video generation services failed**\n\n"
-        f"**What was tried:**\n"
-        f"1. ❌ Replicate (Premium) - Failed or needs billing\n"
-        f"2. ❌ Hugging Face Models (FREE) - All busy/unavailable\n\n"
-        f"**Why this happens:**\n"
-        f"- FREE services require Hugging Face Pro subscription now\n"
-        f"- Replicate needs billing setup to work\n\n"
-        f"**What to do:**\n"
-        f"1. **Setup Replicate billing** (recommended):\n"
-        f"   - Go to https://replicate.com/account/billing\n"
-        f"   - Add payment method (get $10 FREE credit)\n"
-        f"   - Cost: ~$0.01-0.05 per video\n\n"
-        f"2. **Try again later** (free services may work during off-peak hours)\n\n"
-        f"**Alternative FREE services:**\n"
-        f"- 🎬 RunwayML: https://app.runwayml.com (free tier)\n"
-        f"- 🎬 Pika Labs: https://pika.art (Discord bot)\n"
-        f"- 🎬 Haiper AI: https://haiper.ai (new, free)\n"
+    # All methods failed
+    error_msg = (
+        "❌ **All video generation services temporarily unavailable.**\n\n"
+        "**What happened:**\n"
+        "- Hugging Face models are loading (cold start)\n"
+        "- Replicate needs billing credit\n\n"
+        "**Solution:**\n"
+        "🔄 **Wait 20-30 seconds** and try again - HF models will be ready!\n\n"
+        "**Or use these FREE online services:**\n"
+        "- Pika Labs: https://pika.art (best quality, instant)\n"
+        "- RunwayML Gen-2: https://app.runwayml.com (free tier)\n"
+        "- Stable Video: https://huggingface.co/spaces/stabilityai/stable-video-diffusion"
     )
 
-    if current_user["is_guest"]:
-        add_to_guest_history("video_gen", prompt, "Failed - all services unavailable")
-    else:
-        save_interaction_to_db("video_gen", prompt, final_error)
+    if not current_user["is_guest"]:
+        save_interaction_to_db("video_gen", prompt, "Failed - models loading", {"error": "cold_start"})
 
-    yield final_error, None
+    yield error_msg, None
 
 
+# Wrapper function for Gradio (handles generator properly)
 def video_gen_wrapper(prompt):
-    """Wrapper to handle generator streaming properly"""
+    """
+    Wrapper to handle generator streaming properly in Gradio
+    """
     status = ""
     video = None
+
     for s, v in generate_video(prompt):
         status = s
         video = v
         yield status, video
+
+    # Final yield to ensure last values are displayed
     yield status, video
 
 
+# Audio processing for video generation
 def process_audio_for_video_gen(audio_filepath):
-    """Process audio input for video generation"""
+    """
+    Process audio input for video generation
+    """
     guest_check = check_guest_feature_access("Video Generation")
     if guest_check:
-        return guest_check, None
+        yield guest_check, None
+        return
 
     if audio_filepath is None:
-        return "", None
+        yield "", None
+        return
 
     transcribed_text = transcribe_audio(audio_filepath)
 
     if transcribed_text.startswith("❌"):
-        return transcribed_text, None
+        yield transcribed_text, None
+        return
 
-    last_status, last_video = "", None
+    # Use the generator
     for status, video in generate_video(transcribed_text):
-        last_status = status
-        last_video = video
-
-    return last_status, last_video
+        yield status, video
 
 
 # --- Google Image Search ---
@@ -2135,6 +2835,23 @@ with gr.Blocks(title="Manjula AI Assistance", theme=gr.themes.Soft()) as demo:
             user_input = gr.Textbox(placeholder="Enter your message here... or use voice input above",
                                     label="Type your message")
 
+            # Add target language dropdown (initially hidden)
+            target_language_dropdown = gr.Dropdown(
+                label="Select target language",
+                choices=["fr", "es", "hi", "zh", "de"],
+                visible=False
+            )
+
+            # Add translation output textbox and spoken audio output
+            translation_output_textbox = gr.Textbox(label="Translated Text", interactive=False)
+            translation_audio_output = gr.Audio(label="Spoken Output")
+
+            with gr.Row():
+                # Just include the components; Gradio will handle rendering
+                target_language_dropdown
+                translation_output_textbox
+                translation_audio_output
+
             with gr.Row():
                 send_btn = gr.Button("Send", variant="primary")
                 new_chat_btn = gr.Button("🆕 New Chat", variant="secondary")
@@ -2329,8 +3046,8 @@ with gr.Blocks(title="Manjula AI Assistance", theme=gr.themes.Soft()) as demo:
                 outputs=[video_status, video_output]
             )
 
-        with gr.Tab("🌐 Public IP"):
-            gr.Markdown("### 🌎 Check your current public IP address")
+        with gr.Tab("Public IP"):
+            gr.Markdown("### Check your current public IP address")
             ip_output = gr.Markdown(label="IP Address")
             ip_btn = gr.Button("Get Public IP", variant="primary")
 
@@ -2340,12 +3057,88 @@ with gr.Blocks(title="Manjula AI Assistance", theme=gr.themes.Soft()) as demo:
                 outputs=ip_output
             )
 
+        # CORRECT: Translation tab is NOW OUTSIDE Public IP tab
+        with gr.Tab("🌐 Translation", visible=False) as translation_tab:
+            gr.Markdown("## 🌍 Universal Translator - Any Language to Any Language")
+            gr.Markdown(
+                "**Supports:**\n"
+                "- 🇮🇳 **All 22 Indian Languages**: Hindi, Bengali, Telugu, Tamil, Marathi, Gujarati, Urdu, Kannada, Malayalam, Punjabi, Odia, Assamese, and more\n"
+                "- 🌎 **30+ Foreign Languages**: Spanish, French, German, Chinese, Japanese, Korean, Russian, Arabic, Portuguese, and more\n"
+                "- 🎤 **Voice Input**: Speak in any language\n"
+                "- 🔊 **Audio Output**: Hear translation in target language\n"
+                "- 🤖 **Auto-detection**: Automatically detects source language"
+            )
+
+            with gr.Row():
+                mic_translate = gr.Audio(
+                    sources=["microphone"],
+                    type="filepath",
+                    label="🎙️ Speak Your Text (Any Language)"
+                )
+
+            translate_input = gr.Textbox(
+                label="📝 Or Type Your Text",
+                placeholder="Enter text in any language (Hindi, English, Spanish, etc.)...",
+                lines=3
+            )
+
+            with gr.Row():
+                target_lang_dropdown = gr.Dropdown(
+                    label="🎯 Target Language (Select from 50+ languages)",
+                    choices=[(name, code) for name, code in sorted(SUPPORTED_LANGUAGES.items())],
+                    value="hi",  # Default to Hindi
+                    filterable=True
+                )
+                translate_btn = gr.Button("🔄 Translate & Speak", variant="primary", size="lg")
+
+            translation_result = gr.Markdown(label="📄 Translation Result")
+            translation_audio = gr.Audio(label="🔊 Listen to Translation", autoplay=True)
+
+            gr.Examples(
+                examples=[
+                    ["Hello, how are you?", "hi"],
+                    ["नमस्ते, आप कैसे हैं?", "en"],
+                    ["Bonjour, comment allez-vous?", "te"],
+                    ["你好吗？", "ta"],
+                    ["مرحبا، كيف حالك؟", "bn"],
+                ],
+                inputs=[translate_input, target_lang_dropdown],
+                label="💡 Try These Examples"
+            )
+
+            translate_btn.click(
+                perform_translation,
+                inputs=[translate_input, target_lang_dropdown],
+                outputs=[translate_input, translation_audio, translation_result]
+            )
+
+
+            def transcribe_and_translate(audio_filepath, target_lang):
+                if current_user["is_guest"]:
+                    return "", None, "**🔒 Register** to use voice translation."
+
+                if not audio_filepath:
+                    return "", None, "No audio recorded."
+
+                text = transcribe_audio(audio_filepath)
+                if text.startswith("❌"):
+                    return "", None, text
+
+                translated, audio_path, full_msg = perform_translation(text, target_lang)
+                return translated, audio_path, full_msg
+
+
+            mic_translate.change(
+                transcribe_and_translate,
+                inputs=[mic_translate, target_lang_dropdown],
+                outputs=[translate_input, translation_audio, translation_result]
+            )
     # Authentication Event Handlers
     login_btn.click(
         login_user,
         inputs=[login_username, login_password],
         outputs=[login_status, auth_section, main_app, user_info, file_qa_tab, image_gen_tab, image_qa_tab,
-                 image_search_tab, video_gen_tab, stats_btn, history_chatbot, guest_chat_warning, chatbot, session_id, mic_chat]
+                 image_search_tab, video_gen_tab,translation_tab, stats_btn, history_chatbot, guest_chat_warning, chatbot, session_id, mic_chat]
     )
 
     request_otp_btn.click(
@@ -2364,7 +3157,8 @@ with gr.Blocks(title="Manjula AI Assistance", theme=gr.themes.Soft()) as demo:
         logout_user,
         inputs=None,
         outputs=[login_status, auth_section, main_app, user_info, file_qa_tab, image_gen_tab, image_qa_tab,
-                 image_search_tab, video_gen_tab, stats_btn, history_chatbot, guest_chat_warning, chatbot, session_id, mic_chat]
+                 image_search_tab, video_gen_tab, translation_tab, stats_btn, history_chatbot, guest_chat_warning,
+                 chatbot, session_id, mic_chat]
     )
 
 
@@ -2380,11 +3174,18 @@ with gr.Blocks(title="Manjula AI Assistance", theme=gr.themes.Soft()) as demo:
     stats_btn.click(show_stats, outputs=[stats_modal, stats_content])
     close_stats_btn.click(close_stats, outputs=stats_modal)
 
+
+
     demo.load(
-        fn=start_as_guest,
+        start_as_guest,
         inputs=None,
-        outputs=[guest_status, auth_section, main_app, user_info, file_qa_tab, image_gen_tab, image_qa_tab,
-                 image_search_tab, video_gen_tab, stats_btn, history_chatbot, guest_chat_warning, chatbot, session_id, mic_chat]
+        outputs=[
+            guest_status, auth_section, main_app, user_info,
+            file_qa_tab, image_gen_tab, image_qa_tab,
+            image_search_tab, video_gen_tab, translation_tab,
+            stats_btn, history_chatbot, guest_chat_warning,
+            chatbot, session_id, mic_chat
+        ]
     )
 
 if __name__ == "__main__":
